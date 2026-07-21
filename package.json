@@ -1,0 +1,61 @@
+{
+    "name": "minep2p",
+    "version": "6.25.3",
+    "description": "MineP2P - A Node.js P2P networking library with UDP hole punching, virtual LAN, file transfer, and Python-style plugin system",
+    "main": "index.js",
+    "bin": {
+        "mp": "bin/mp.js",
+        "mp2": "bin/mp.js",
+        "minep2p": "bin/mp.js"
+    },
+    "scripts": {
+        "start": "node cli.js start",
+        "test": "node test.js"
+    },
+    "keywords": [
+        "p2p",
+        "webrtc",
+        "networking",
+        "wrtc-neo",
+        "signaling",
+        "ice",
+        "plugin",
+        "plugin-dsl",
+        "hole-punching",
+        "virtual-lan",
+        "game-multiplayer",
+        "minecraft",
+        "terraria",
+        "file-transfer",
+        "nat-traversal"
+    ],
+    "author": {
+        "name": "Vexify",
+        "email": "support@vexify.top"
+    },
+    "license": "Apache-2.0",
+    "copyright": "Copyright (c) Vexify 2026",
+    "dependencies": {
+        "@vexify-org/yaggs": "^8.1.0",
+        "chalk": "^4.1.2",
+        "node-fetch": "^3.3.2",
+        "uuid": "^9.0.1",
+        "wrtc-neo": "^7.9.1"
+    },
+    "publisher": {
+        "name": "Vexify",
+        "email": "support@vexify.top"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "files": [
+        "index.js",
+        "cli.js",
+        "bin/",
+        "lib/",
+        "plugins/",
+        "README.md",
+        "LICENSE"
+    ]
+}
