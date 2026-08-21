@@ -1,6 +1,6 @@
 {
     "name": "minep2p",
-    "version": "6.25.3",
+    "version": "7.0.0",
     "description": "MineP2P - A Node.js P2P networking library with UDP hole punching, virtual LAN, file transfer, and Python-style plugin system",
     "main": "index.js",
     "bin": {
@@ -10,7 +10,7 @@
     },
     "scripts": {
         "start": "node cli.js start",
-        "test": "node test.js"
+        "test": "node smoke-plugin-test.js"
     },
     "keywords": [
         "p2p",

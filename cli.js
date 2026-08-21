@@ -5,273 +5,175 @@ const chalk = require('chalk');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const fetch = require('node-fetch').default || require('node-fetch');
 
 const Daemon = require('./lib/daemon');
 const Store = require('./lib/store');
 const BuiltinSignaling = require('./lib/builtin-signaling');
 
-/**
- * 生成随机房间码
- * 格式: mp-{node}-{随机字符}
- */
+// ============================================================
+// 常量
+// ============================================================
+const DAEMON_URL = 'http://127.0.0.1:9527';
+const HTTP_PORT = 9527;
+const STORE_URL = 'https://raw.githubusercontent.com/vexify-org/mp-store/main';
+const PLUGINS_DIR = path.join(os.homedir(), '.minep2p', 'plugins');
+const HOME_DIR = path.join(os.homedir(), '.minep2p');
+const KNOWN_COMMANDS = [
+    'start', 'stop', 'status', 'add', 'send', 'messages', 'logs', 'set', 'get',
+    'config', 'config-reset', 'store', 'search', 'install', 'plugins', 'network',
+    'peers', 'punch'
+];
+
+/** 生成随机房间码: mp-{node}-{随机字符} */
 const generateRoomCode = () => {
     const node = 'n1'; // 默认走大容量节点
-    const random = crypto.randomBytes(6).toString('base64url'); // 8字符，URL安全
+    const random = crypto.randomBytes(6).toString('base64url'); // 8字符,URL 安全
     return `mp-${node}-${random}`;
 };
 
+// ============================================================
+// Daemon 模式: 内置信令 HTTP 服务 + 常驻进程
+// ============================================================
 const runDaemon = async (room) => {
     try {
         console.log(`[${new Date().toISOString()}] Running daemon for room: ${room}`);
         const MineP2P = require('./lib/client');
         const http = require('http');
 
-        // 内置信令服务器（先于 client 创建）
+        // 内置信令服务器(先于 client 创建)
         const signaling = new BuiltinSignaling();
 
-        // HTTP 服务器（先启动，再创建 client，因为 client 的 signaling 需要访问 HTTP API）
+        // HTTP 服务器(先启动,因为 client 的 signaling 需要访问 HTTP API)
         const server = http.createServer(async (req, res) => {
             res.setHeader('Content-Type', 'application/json');
+            const url = new URL(req.url, `http://${req.headers.host}`);
+            const send = (status, body) => {
+                res.statusCode = status;
+                res.end(JSON.stringify(body));
+            };
+            const readBody = () => new Promise((resolve) => {
+                let body = '';
+                req.on('data', c => body += c);
+                req.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { resolve({}); } });
+            });
 
-            if (req.method === 'POST' && req.url === '/network/start') {
-                try {
-                    const info = await client.startNetwork({ tun: true });
-                    res.end(JSON.stringify(info));
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'POST' && req.url === '/network/start-server') {
-                try {
-                    const info = await client.startNetworkAsServer();
-                    res.end(JSON.stringify(info));
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'POST' && req.url === '/network/connect-client') {
-                try {
-                    let body = '';
-                    req.on('data', chunk => body += chunk);
-                    req.on('end', async () => {
-                        try {
-                            const { serverHost, serverPort, staticKey } = JSON.parse(body);
-                            const info = await client.startNetworkAsClient(serverHost, serverPort, staticKey);
-                            res.end(JSON.stringify(info));
-                        } catch (e) {
-                            res.statusCode = 500;
-                            res.end(JSON.stringify({ error: e.message }));
-                        }
-                    });
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'POST' && req.url === '/network/connect-room') {
-                try {
-                    const peers = await client.connectRoomNetwork();
-                    res.end(JSON.stringify({ peers }));
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'GET' && req.url === '/network/status') {
-                try {
-                    const status = client.getNetworkStatus();
-                    res.end(JSON.stringify(status));
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'POST' && req.url === '/sandbox') {
-                try {
-                    let body = '';
-                    req.on('data', chunk => body += chunk);
-                    req.on('end', async () => {
-                        try {
-                            const { action, plugin, permission } = JSON.parse(body);
-                            const PluginSandbox = require('./lib/plugin-sandbox');
-                            const sandbox = client.pluginLoader ? client.pluginLoader.sandbox : null;
+            try {
+                if (req.method === 'POST' && req.url === '/network/start') {
+                    send(200, await client.startNetwork({ tun: true }));
 
-                            if (!sandbox) {
-                                res.end(JSON.stringify({ error: 'Sandbox not available' }));
-                                return;
-                            }
+                } else if (req.method === 'POST' && req.url === '/network/start-server') {
+                    send(200, await client.startNetworkAsServer());
 
-                            if (action === 'blacklist' && plugin) {
-                                sandbox.blacklist(plugin);
-                                res.end(JSON.stringify({ blacklisted: plugin, blacklist: sandbox.getBlacklist() }));
-                            } else if (action === 'stats') {
-                                res.end(JSON.stringify(sandbox.getAllStats()));
-                            } else if (action === 'permissions' && plugin) {
-                                res.end(JSON.stringify({ plugin, permissions: sandbox.getPermissions(plugin) }));
-                            } else {
-                                res.end(JSON.stringify({ error: 'Unknown action' }));
-                            }
-                        } catch (e) {
-                            res.statusCode = 400;
-                            res.end(JSON.stringify({ error: e.message }));
-                        }
-                    });
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'POST' && req.url === '/signal/join') {
-                try {
-                    let body = '';
-                    req.on('data', chunk => body += chunk);
-                    req.on('end', () => {
-                        try {
-                            const { room, peerId } = JSON.parse(body);
-                            const result = signaling.join(room, peerId);
-                            res.end(JSON.stringify(result));
-                        } catch (e) {
-                            res.statusCode = 400;
-                            res.end(JSON.stringify({ error: e.message }));
-                        }
-                    });
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'POST' && req.url === '/signal/leave') {
-                try {
-                    let body = '';
-                    req.on('data', chunk => body += chunk);
-                    req.on('end', () => {
-                        try {
-                            const { room, peerId } = JSON.parse(body);
-                            signaling.leave(room, peerId);
-                            res.end(JSON.stringify({ ok: true }));
-                        } catch (e) {
-                            res.statusCode = 400;
-                            res.end(JSON.stringify({ error: e.message }));
-                        }
-                    });
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'GET' && req.url.startsWith('/signal/poll')) {
-                try {
-                    const url = new URL(req.url, `http://${req.headers.host}`);
-                    const room = url.searchParams.get('room');
-                    const peerId = url.searchParams.get('peerId');
-                    const timeout = parseInt(url.searchParams.get('timeout') || '30000');
+                } else if (req.method === 'POST' && req.url === '/network/connect-client') {
+                    const { serverHost, serverPort, staticKey } = await readBody();
+                    send(200, await client.startNetworkAsClient(serverHost, serverPort, staticKey));
 
-                    if (!room || !peerId) {
-                        res.statusCode = 400;
-                        res.end(JSON.stringify({ error: 'Missing room or peerId' }));
-                        return;
+                } else if (req.method === 'POST' && req.url === '/network/connect-room') {
+                    send(200, { peers: await client.connectRoomNetwork() });
+
+                } else if (req.method === 'GET' && req.url === '/network/status') {
+                    send(200, client.getNetworkStatus());
+
+                } else if (req.method === 'POST' && req.url === '/sandbox') {
+                    const { action, plugin } = await readBody();
+                    const sandbox = client.pluginLoader ? client.pluginLoader.sandbox : null;
+                    if (!sandbox) { send(200, { error: 'Sandbox not available' }); return; }
+
+                    if (action === 'blacklist' && plugin) {
+                        sandbox.blacklist(plugin);
+                        send(200, { blacklisted: plugin, blacklist: sandbox.getBlacklist() });
+                    } else if (action === 'stats') {
+                        send(200, sandbox.getAllStats());
+                    } else if (action === 'permissions' && plugin) {
+                        send(200, { plugin, permissions: sandbox.getPermissions(plugin) });
+                    } else {
+                        send(200, { error: 'Unknown action' });
                     }
 
-                    const result = await signaling.poll(room, peerId, timeout);
-                    res.end(JSON.stringify(result));
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'POST' && req.url === '/signal/message') {
-                try {
-                    let body = '';
-                    req.on('data', chunk => body += chunk);
-                    req.on('end', () => {
-                        try {
-                            const { room, fromPeerId, targetPeerId, message } = JSON.parse(body);
-                            if (targetPeerId) {
-                                signaling.sendMessage(room, targetPeerId, message);
-                            } else {
-                                signaling.broadcastMessage(room, fromPeerId, message);
-                            }
-                            res.end(JSON.stringify({ ok: true }));
-                        } catch (e) {
-                            res.statusCode = 400;
-                            res.end(JSON.stringify({ error: e.message }));
-                        }
-                    });
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else if (req.method === 'GET' && req.url.startsWith('/signal/peers')) {
-                try {
-                    const url = new URL(req.url, `http://${req.headers.host}`);
+                } else if (req.method === 'POST' && req.url === '/signal/join') {
+                    const { room: r, peerId } = await readBody();
+                    send(200, signaling.join(r, peerId));
+
+                } else if (req.method === 'POST' && req.url === '/signal/leave') {
+                    const { room: r, peerId } = await readBody();
+                    signaling.leave(r, peerId);
+                    send(200, { ok: true });
+
+                } else if (req.method === 'GET' && req.url.startsWith('/signal/poll')) {
                     const room = url.searchParams.get('room');
-                    const peers = room ? signaling.getPeers(room) : [];
-                    res.end(JSON.stringify({ peers }));
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
+                    const peerId = url.searchParams.get('peerId');
+                    const timeout = parseInt(url.searchParams.get('timeout') || '30000', 10);
+                    if (!room || !peerId) { send(400, { error: 'Missing room or peerId' }); return; }
+                    send(200, await signaling.poll(room, peerId, timeout));
+
+                } else if (req.method === 'POST' && req.url === '/signal/message') {
+                    const { room: r, fromPeerId, targetPeerId, message } = await readBody();
+                    if (targetPeerId) {
+                        signaling.sendMessage(r, targetPeerId, message);
+                    } else {
+                        signaling.broadcastMessage(r, fromPeerId, message);
+                    }
+                    send(200, { ok: true });
+
+                } else if (req.method === 'GET' && req.url.startsWith('/signal/peers')) {
+                    const room = url.searchParams.get('room');
+                    send(200, { peers: room ? signaling.getPeers(room) : [] });
+
+                } else if (req.method === 'POST' && req.url === '/signal/switch-hub') {
+                    const { hubUrl, room: targetRoom } = await readBody();
+                    for (const [r, sig] of client.signalings) {
+                        sig.stopPolling();
+                        sig.setHubUrl(hubUrl);
+                        await sig.join(r);
+                        sig.startPolling();
+                    }
+                    if (targetRoom && !client.rooms.has(targetRoom)) {
+                        await client.start(targetRoom);
+                    }
+                    send(200, { ok: true, hubUrl, room: targetRoom });
+
+                } else {
+                    send(404, { error: 'Not found' });
                 }
-            } else if (req.method === 'POST' && req.url === '/signal/switch-hub') {
-                try {
-                    let body = '';
-                    req.on('data', chunk => body += chunk);
-                    req.on('end', async () => {
-                        try {
-                            const { hubUrl, room } = JSON.parse(body);
-                            // 切换信令到远程 daemon
-                            for (const [r, sig] of client.signalings) {
-                                sig.stopPolling();
-                                sig.setHubUrl(hubUrl);
-                                await sig.join(r);
-                                sig.startPolling();
-                            }
-                            // 如果指定了 room 且不在当前 rooms 里，加入
-                            if (room && !client.rooms.has(room)) {
-                                await client.start(room);
-                            }
-                            res.end(JSON.stringify({ ok: true, hubUrl, room }));
-                        } catch (e) {
-                            res.statusCode = 500;
-                            res.end(JSON.stringify({ error: e.message }));
-                        }
-                    });
-                } catch (e) {
-                    res.statusCode = 500;
-                    res.end(JSON.stringify({ error: e.message }));
-                }
-            } else {
-                res.statusCode = 404;
-                res.end(JSON.stringify({ error: 'Not found' }));
+            } catch (e) {
+                send(500, { error: e.message });
             }
         });
 
-        // 先启动 HTTP 服务器
+        // 启动 HTTP 服务器
         await new Promise((resolve, reject) => {
-            server.listen(9527, '0.0.0.0', () => {
-                console.log(`[${new Date().toISOString()}] HTTP server listening on 0.0.0.0:9527`);
+            server.listen(HTTP_PORT, '0.0.0.0', () => {
+                console.log(`[${new Date().toISOString()}] HTTP server listening on 0.0.0.0:${HTTP_PORT}`);
                 resolve();
             });
             server.on('error', reject);
         });
 
-        // 创建 client，使用内置信令
-        let client = new MineP2P({ signalingHub: 'http://127.0.0.1:9527' });
+        // 创建 client,使用内置信令
+        let client = new MineP2P({ signalingHub: `${DAEMON_URL}` });
         console.log(`[${new Date().toISOString()}] Client created, peerId: ${client.peerId.substring(0, 8)}...`);
 
-        // 加载插件
+        // 加载插件(内置 + 用户)
         const BUILTIN_PLUGINS = path.join(__dirname, 'plugins');
-        const USER_PLUGINS = path.join(require('os').homedir(), '.minep2p', 'plugins');
         client.loadPlugins(BUILTIN_PLUGINS);
-        client.loadPlugins(USER_PLUGINS);
-        
+        client.loadPlugins(PLUGINS_DIR);
+
         client.on('connect', () => {
             const status = Daemon.getStatus();
             status.status = 'connected';
-            fs.writeFileSync(path.join(require('os').homedir(), '.minep2p', 'daemon.json'), JSON.stringify(status, null, 2));
+            fs.writeFileSync(path.join(HOME_DIR, 'daemon.json'), JSON.stringify(status, null, 2));
         });
-        
+
         client.on('peerConnect', (peerId) => {
             console.log(`[${new Date().toISOString()}] Peer connected: ${peerId.substring(0, 8)}...`);
         });
-        
+
         client.on('peerDisconnect', (peerId) => {
             console.log(`[${new Date().toISOString()}] Peer disconnected: ${peerId.substring(0, 8)}...`);
         });
-        
+
         client.on('message', (peerId, message) => {
             console.log(`[${new Date().toISOString()}] [${peerId.substring(0, 8)}] ${JSON.stringify(message)}`);
             Store.saveMessage(room, {
@@ -281,23 +183,23 @@ const runDaemon = async (room) => {
                 timestamp: Date.now()
             });
         });
-        
+
         client.on('error', (error) => {
             console.log(`[${new Date().toISOString()}] Error: ${error.message}`);
         });
-        
-        console.log(`[${new Date().toISOString()}] Starting client for room: ${room}`);
+
+        // 启动客户端并注册到内置信令
         try {
             await client.start(room);
             console.log(`[${new Date().toISOString()}] Client started successfully`);
-            // 自动注册到内置信令
             signaling.join(room, client.peerId);
             console.log(`[${new Date().toISOString()}] Registered in builtin signaling: ${client.peerId.substring(0, 8)}...`);
         } catch (err) {
             console.log(`[${new Date().toISOString()}] Client start failed: ${err.message}`);
             console.log(`[${new Date().toISOString()}] Running in offline/LAN-only mode`);
         }
-        
+
+        // 轮询命令文件(daemon 间通信)
         setInterval(async () => {
             const command = Daemon.getCommand();
             if (command) {
@@ -306,25 +208,17 @@ const runDaemon = async (room) => {
                     console.log(`[${new Date().toISOString()}] Adding room: ${command.room}`);
                     await client.start(command.room);
                 } else if (command.action === 'send') {
-                    const peerCount = client.peers.size;
-                    console.log(`[${new Date().toISOString()}] Broadcasting message to ${peerCount} peers`);
-                    client.plugins.handleMessage(command.message, {
-                        peerId: null,
-                        room
-                    });
+                    client.plugins.handleMessage(command.message, { peerId: null, room });
                     client.broadcast({ type: 'chat', content: command.message });
                     Store.saveMessage(room, {
-                        from: 'me',
-                        content: command.message,
-                        type: 'chat',
-                        timestamp: Date.now()
+                        from: 'me', content: command.message, type: 'chat', timestamp: Date.now()
                     });
                 }
             }
         }, 1000);
-        
+
+        // 常驻(永不退出),保持事件循环活跃
         await new Promise(() => {});
-        
     } catch (error) {
         console.log(`[${new Date().toISOString()}] Daemon error: ${error.message}`);
         console.log(`[${new Date().toISOString()}] Error stack: ${error.stack}`);
@@ -332,21 +226,9 @@ const runDaemon = async (room) => {
     }
 };
 
-const isDaemon = process.argv.slice(1).includes('--daemon');
-
-if (isDaemon) {
-    const roomArg = process.argv.find((arg, i) => arg === '--room' || arg === '-r');
-    const room = roomArg ? process.argv[process.argv.indexOf(roomArg) + 1] : 'minep2p-default';
-    runDaemon(room).catch(err => {
-        console.error(err);
-        process.exit(1);
-    });
-    // daemon 模式下跳过 CLI 解析，防止 runDaemon 和 yaggs 命令冲突
-    return;
-}
-
-const DAEMON_URL = 'http://127.0.0.1:9527';
-
+// ============================================================
+// CLI 辅助
+// ============================================================
 const printHeader = () => {
     console.log(chalk.blue.bold('╔══════════════════════════════════════════╗'));
     console.log(chalk.blue.bold('║           MineP2P - Vexify 2026          ║'));
@@ -356,21 +238,20 @@ const printHeader = () => {
     console.log('');
 };
 
-const formatTimestamp = (ts) => {
-    if (!ts) return 'N/A';
-    return new Date(ts).toLocaleString();
-};
+const formatTimestamp = (ts) => ts ? new Date(ts).toLocaleString() : 'N/A';
 
+// ============================================================
+// 生命周期命令
+// ============================================================
 const startCommand = async (argv) => {
     printHeader();
-    
-    // 自动生成房间码（如果没有指定，或 argv.room 被 yaggs 错误赋值为命令名）
-    const knownCommands = ['start', 'stop', 'status', 'add', 'send', 'messages', 'logs', 'set', 'get', 'config', 'config-reset', 'store', 'search', 'install', 'plugins', 'network', 'peers', 'punch'];
-    const room = (argv.room && !knownCommands.includes(argv.room)) ? argv.room : generateRoomCode();
-    
+
+    // 自动生成房间码(未指定或 argv.room 被 yaggs 错误赋值为命令名时)
+    const room = (argv.room && !KNOWN_COMMANDS.includes(argv.room)) ? argv.room : generateRoomCode();
+
     try {
         const status = await Daemon.start(room);
-        
+
         console.log(chalk.green('✓ MineP2P daemon started successfully!'));
         console.log('');
         console.log(chalk.cyan('Room Code:'));
@@ -385,7 +266,6 @@ const startCommand = async (argv) => {
         console.log(chalk.yellow('Use "mp stop" to stop the daemon'));
         console.log(chalk.yellow('Use "mp status" to check status'));
         console.log(chalk.yellow('Use "mp add <room>" to join another room'));
-        
     } catch (error) {
         console.log(chalk.red(`✗ Failed to start: ${error.message}`));
         process.exit(1);
@@ -394,13 +274,10 @@ const startCommand = async (argv) => {
 
 const stopCommand = async () => {
     printHeader();
-    
     try {
-        const status = await Daemon.stop();
-        
+        await Daemon.stop();
         console.log(chalk.green('✓ MineP2P daemon stopped successfully'));
         console.log('');
-        
     } catch (error) {
         console.log(chalk.yellow(`Note: ${error.message}`));
     }
@@ -408,9 +285,8 @@ const stopCommand = async () => {
 
 const statusCommand = () => {
     printHeader();
-    
     const status = Daemon.getStatus();
-    
+
     if (status.running) {
         console.log(chalk.green('Status: Running'));
         console.log(chalk.cyan('Daemon Info:'));
@@ -418,45 +294,37 @@ const statusCommand = () => {
         console.log(`  Main Room: ${status.room}`);
         console.log(`  Joined Rooms: ${status.rooms.length > 0 ? status.rooms.join(', ') : 'None'}`);
         console.log(`  Started at: ${formatTimestamp(status.startedAt)}`);
-        
-        const rooms = Store.getAllRooms();
-        if (rooms.length > 0) {
-            console.log('');
-            console.log(chalk.cyan('Local Storage:'));
-            rooms.forEach(room => {
-                const stats = Store.getRoomStats(room);
-                console.log(`  - ${room}: ${stats.messageCount} messages`);
-            });
-        }
-        
+
+        printLocalStorage();
     } else {
         console.log(chalk.yellow('Status: Stopped'));
         console.log('');
-        console.log(chalk.cyan('Local Storage:'));
-        const rooms = Store.getAllRooms();
-        if (rooms.length > 0) {
-            rooms.forEach(room => {
-                const stats = Store.getRoomStats(room);
-                console.log(`  - ${room}: ${stats.messageCount} messages`);
-            });
-        } else {
-            console.log('  No stored messages');
-        }
+        printLocalStorage();
+    }
+};
+
+const printLocalStorage = () => {
+    console.log(chalk.cyan('Local Storage:'));
+    const rooms = Store.getAllRooms();
+    if (rooms.length > 0) {
+        rooms.forEach(room => {
+            const stats = Store.getRoomStats(room);
+            console.log(`  - ${room}: ${stats.messageCount} messages`);
+        });
+    } else {
+        console.log('  No stored messages');
     }
 };
 
 const addCommand = async (argv) => {
     printHeader();
-    
     const room = argv.room;
-    
+
     try {
         Daemon.addRoom(room);
-        
         console.log(chalk.green(`✓ Room "${room}" added`));
         console.log('');
         console.log(chalk.yellow('The daemon will join this room shortly'));
-        
     } catch (error) {
         console.log(chalk.red(`✗ Failed to add room: ${error.message}`));
         process.exit(1);
@@ -465,14 +333,11 @@ const addCommand = async (argv) => {
 
 const sendCommand = async (argv) => {
     printHeader();
-    
     const message = argv.message || 'Hello from MineP2P';
-    
+
     try {
         Daemon.sendMessage(message);
-        
         console.log(chalk.green(`✓ Message sent: "${message}"`));
-        
     } catch (error) {
         console.log(chalk.red(`✗ Failed to send message: ${error.message}`));
         process.exit(1);
@@ -481,17 +346,15 @@ const sendCommand = async (argv) => {
 
 const messagesCommand = (argv) => {
     printHeader();
-    
     const room = argv.room || 'minep2p-default';
     const limit = argv.limit || 20;
-    
     const messages = Store.getMessages(room, limit);
-    
+
     console.log(chalk.cyan(`Messages in room: ${room}`));
     console.log('');
-    
+
     if (messages.length > 0) {
-        messages.forEach((msg, index) => {
+        messages.forEach((msg) => {
             const time = formatTimestamp(msg.timestamp);
             const from = msg.from === 'me' ? chalk.green(msg.from) : chalk.cyan(msg.from);
             console.log(`${from} [${time}]: ${msg.content}`);
@@ -503,15 +366,13 @@ const messagesCommand = (argv) => {
 
 const logsCommand = () => {
     printHeader();
-
-    const logFile = path.join(require('os').homedir(), '.minep2p', 'daemon.log');
+    const logFile = path.join(HOME_DIR, 'daemon.log');
 
     try {
         if (fs.existsSync(logFile)) {
-            const logs = fs.readFileSync(logFile, 'utf8');
             console.log(chalk.cyan('Daemon Logs:'));
             console.log('');
-            console.log(logs);
+            console.log(fs.readFileSync(logFile, 'utf8'));
         } else {
             console.log(chalk.yellow('No logs found'));
         }
@@ -521,23 +382,27 @@ const logsCommand = () => {
     }
 };
 
+// ============================================================
+// 配置命令
+// ============================================================
+const printConfigKeys = () => {
+    console.log('');
+    console.log(chalk.cyan('Available keys:'));
+    Object.entries(Store.getConfigurableKeys()).forEach(([k, v]) => {
+        console.log(`  ${chalk.yellow(k)} - ${v.desc} (${v.type})`);
+    });
+};
+
 const setCommand = (argv) => {
     printHeader();
-
     const key = argv.key || argv._[0];
     const value = argv.value || argv._[1];
 
     if (!key) {
         console.log(chalk.red('✗ Missing config key'));
-        console.log('');
-        console.log(chalk.cyan('Available keys:'));
-        const keys = Store.getConfigurableKeys();
-        Object.entries(keys).forEach(([k, v]) => {
-            console.log(`  ${chalk.yellow(k)} - ${v.desc} (${v.type})`);
-        });
+        printConfigKeys();
         process.exit(1);
     }
-
     if (!value) {
         console.log(chalk.red('✗ Missing value'));
         console.log('');
@@ -550,19 +415,13 @@ const setCommand = (argv) => {
         console.log(chalk.green(`✓ Config updated: ${key} = ${result}`));
     } catch (error) {
         console.log(chalk.red(`✗ ${error.message}`));
-        console.log('');
-        console.log(chalk.cyan('Available keys:'));
-        const keys = Store.getConfigurableKeys();
-        Object.entries(keys).forEach(([k, v]) => {
-            console.log(`  ${chalk.yellow(k)} - ${v.desc} (${v.type})`);
-        });
+        printConfigKeys();
         process.exit(1);
     }
 };
 
 const getCommand = (argv) => {
     printHeader();
-
     const key = argv.key || argv._[0];
 
     if (key) {
@@ -580,12 +439,10 @@ const getCommand = (argv) => {
         }
     } else {
         const config = Store.getAllConfig();
-        const keys = Store.getConfigurableKeys();
-
         console.log(chalk.cyan('All Config:'));
         console.log('');
 
-        Object.entries(keys).forEach(([k, v]) => {
+        Object.entries(Store.getConfigurableKeys()).forEach(([k, v]) => {
             const value = config[k];
             if (value !== undefined) {
                 console.log(`  ${chalk.yellow(k)}: ${chalk.green(value)} (${v.desc})`);
@@ -602,24 +459,19 @@ const getCommand = (argv) => {
 
 const configCommand = () => {
     printHeader();
-
     const keys = Store.getConfigurableKeys();
     const config = Store.getAllConfig();
     const defaultConfig = require('./lib/config');
 
     console.log(chalk.cyan('Configuration Manager:'));
     console.log('');
-    console.log(chalk.cyan('Available options:'));
-    console.log('');
 
     Object.entries(keys).forEach(([key, info]) => {
         const customValue = config[key];
-        const defaultValue = defaultConfig[key];
-
         console.log(`  ${chalk.yellow(key)}`);
         console.log(`    Description: ${info.desc}`);
         console.log(`    Type: ${info.type}`);
-        console.log(`    Default: ${chalk.gray(defaultValue)}`);
+        console.log(`    Default: ${chalk.gray(defaultConfig[key])}`);
         if (customValue !== undefined) {
             console.log(`    Current: ${chalk.green(customValue)}`);
         }
@@ -634,7 +486,6 @@ const configCommand = () => {
 
 const resetCommand = (argv) => {
     printHeader();
-
     const key = argv.key;
 
     try {
@@ -650,63 +501,57 @@ const resetCommand = (argv) => {
     }
 };
 
-// ========== 插件商店命令 ==========
-
-const STORE_URL = 'https://raw.githubusercontent.com/vexify-org/mp-store/main';
-const PLUGINS_DIR = path.join(require('os').homedir(), '.minep2p', 'plugins');
-
-const storeCommand = async (argv) => {
+// ============================================================
+// 插件商店命令
+// ============================================================
+const storeCommand = async () => {
     printHeader();
-
     console.log(chalk.cyan('🔌 MineP2P Plugin Store'));
     console.log('');
-    console.log(chalk.gray(`Store: https://github.com/vexify-org/mp-store`));
-    console.log('');
+    console.log(chalk.gray('Store: https://github.com/vexify-org/mp-store'));
 
     try {
         const response = await fetch(`${STORE_URL}/index.json`);
         if (!response.ok) {
             throw new Error('Failed to fetch plugin index');
         }
-
-        const data = await response.json();
-        const plugins = data.plugins || [];
+        const plugins = (await response.json()).plugins || [];
 
         if (plugins.length === 0) {
             console.log(chalk.yellow('No plugins available'));
             return;
         }
 
+        console.log('');
         console.log(chalk.cyan('Available Plugins:'));
         console.log('');
-
         for (const plugin of plugins) {
             console.log(`  ${chalk.green(plugin.name)} ${chalk.gray(`v${plugin.version}`)}`);
             console.log(`    ${chalk.gray(plugin.description || 'No description')}`);
             console.log(`    ${chalk.yellow('mp install ' + plugin.name)}`);
             console.log('');
         }
-
-        console.log(chalk.cyan('Commands:'));
-        console.log(`  ${chalk.yellow('mp store')}          - 列出所有插件`);
-        console.log(`  ${chalk.yellow('mp search <name>')}  - 搜索插件`);
-        console.log(`  ${chalk.yellow('mp install <name>')} - 安装插件`);
-        console.log(`  ${chalk.yellow('mp plugins')}        - 查看已安装`);
-
+        printStoreCommands();
     } catch (error) {
         console.log(chalk.red(`✗ Failed to connect to store: ${error.message}`));
     }
 };
 
+const printStoreCommands = () => {
+    console.log(chalk.cyan('Commands:'));
+    console.log(`  ${chalk.yellow('mp store')}          - 列出所有插件`);
+    console.log(`  ${chalk.yellow('mp search <name>')}  - 搜索插件`);
+    console.log(`  ${chalk.yellow('mp install <name>')} - 安装插件`);
+    console.log(`  ${chalk.yellow('mp plugins')}        - 查看已安装`);
+};
+
 const searchCommand = async (argv) => {
     printHeader();
-
     const query = argv.query.toLowerCase();
 
     try {
         const response = await fetch(`${STORE_URL}/index.json`);
-        const data = await response.json();
-        const plugins = (data.plugins || []).filter(p =>
+        const plugins = ((await response.json()).plugins || []).filter(p =>
             p.name.toLowerCase().includes(query) ||
             (p.description && p.description.toLowerCase().includes(query))
         );
@@ -724,7 +569,6 @@ const searchCommand = async (argv) => {
             console.log(`    ${chalk.gray(plugin.description || 'No description')}`);
             console.log('');
         }
-
     } catch (error) {
         console.log(chalk.red(`✗ Search failed: ${error.message}`));
     }
@@ -732,44 +576,34 @@ const searchCommand = async (argv) => {
 
 const installCommand = async (argv) => {
     printHeader();
-
     const name = argv.name;
-
     console.log(chalk.cyan(`Installing plugin: ${name}`));
 
     try {
-        // 确保插件目录存在
         if (!fs.existsSync(PLUGINS_DIR)) {
             fs.mkdirSync(PLUGINS_DIR, { recursive: true });
         }
 
-        // 获取插件索引
         const indexResponse = await fetch(`${STORE_URL}/index.json`);
-        const data = await indexResponse.json();
-        const plugin = (data.plugins || []).find(p => p.name === name);
+        const plugin = ((await indexResponse.json()).plugins || []).find(p => p.name === name);
 
         if (!plugin) {
             console.log(chalk.red(`✗ Plugin "${name}" not found`));
             process.exit(1);
         }
 
-        // 下载插件文件
-        const pluginUrl = `${STORE_URL}/plugins/${name}.mp`;
-        const pluginResponse = await fetch(pluginUrl);
-
+        const pluginResponse = await fetch(`${STORE_URL}/plugins/${name}.mp`);
         if (!pluginResponse.ok) {
             throw new Error('Failed to download plugin');
         }
 
         const pluginContent = await pluginResponse.text();
         const pluginPath = path.join(PLUGINS_DIR, `${name}.mp`);
-
         fs.writeFileSync(pluginPath, pluginContent);
 
         console.log(chalk.green(`✓ Plugin "${name}" installed successfully!`));
         console.log('');
         console.log(chalk.gray(`Installed to: ${pluginPath}`));
-
     } catch (error) {
         console.log(chalk.red(`✗ Install failed: ${error.message}`));
         process.exit(1);
@@ -778,7 +612,6 @@ const installCommand = async (argv) => {
 
 const pluginsCommand = () => {
     printHeader();
-
     console.log(chalk.cyan('Installed Plugins:'));
     console.log('');
 
@@ -807,7 +640,9 @@ const pluginsCommand = () => {
     }
 };
 
+// ============================================================
 // 网络命令
+// ============================================================
 const networkCommand = async (argv) => {
     printHeader();
 
@@ -819,24 +654,23 @@ const networkCommand = async (argv) => {
 
     try {
         const isClient = argv.client;
-        const serverHost = argv.server || argv._?.[1];
+        const serverHost = argv.server || argv._ ?.[1];
         const serverPort = argv.port || 1194;
         const staticKey = argv.key || '';
 
         let result;
         if (isClient && serverHost) {
-            // 客户端模式
+            // 客户端模式: 连接 OVPN 服务器
             console.log(chalk.cyan(`Connecting to OVPN server at ${serverHost}:${serverPort}...`));
-            const body = JSON.stringify({ serverHost, serverPort: parseInt(serverPort), staticKey });
             const response = await fetch(`${DAEMON_URL}/network/connect-client`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body
+                body: JSON.stringify({ serverHost, serverPort: parseInt(serverPort, 10), staticKey })
             });
             result = await response.json();
 
             if (!result.error) {
-                // 切换信令到主机 daemon，实现 peer 发现
+                // 切换信令到主机 daemon,实现 peer 发现
                 console.log(chalk.cyan(`Linking signaling to host daemon at ${serverHost}:9527...`));
                 try {
                     const switchBody = JSON.stringify({ hubUrl: `http://${serverHost}:9527`, room: null });
@@ -851,7 +685,7 @@ const networkCommand = async (argv) => {
                 }
             }
         } else {
-            // 服务器模式（默认）
+            // 服务器模式(默认)
             const response = await fetch(`${DAEMON_URL}/network/start-server`, { method: 'POST' });
             result = await response.json();
         }
@@ -865,11 +699,11 @@ const networkCommand = async (argv) => {
         console.log('');
         console.log(chalk.cyan('Virtual LAN:'));
         console.log(`  Local IP: ${chalk.yellow(result.virtualIP)}`);
-        console.log(`  Public:   ${result.publicAddress?.address || 'unknown'}:${result.publicAddress?.port || '?'}`);
+        console.log(`  Public:   ${result.publicAddress ? result.publicAddress.address : 'unknown'}:${result.publicAddress ? result.publicAddress.port : '?'}`);
         console.log(`  Mode:     ${result.mode === 'ovpn' ? chalk.green('OVPN (virtual NIC)') : chalk.yellow('UDP (proxy)')}`);
         console.log('');
 
-        // OVPN 服务器模式：显示分享信息
+        // OVPN 服务器模式: 显示分享信息
         if (result.ovpnInfo && result.ovpnInfo.staticKey) {
             console.log(chalk.cyan('OVPN Share Info:'));
             console.log(chalk.gray('  Share this with others:'));
@@ -907,16 +741,15 @@ const networkCommand = async (argv) => {
             console.log(chalk.yellow('No peers in room yet'));
             console.log('');
             console.log(chalk.gray('Share this info with other players:'));
-            console.log(chalk.gray(`  Public IP: ${result.publicAddress?.address || 'unknown'}:${result.publicAddress?.port || '?'}`));
+            console.log(chalk.gray(`  Public IP: ${result.publicAddress ? result.publicAddress.address : 'unknown'}:${result.publicAddress ? result.publicAddress.port : '?'}`));
         }
-
     } catch (error) {
         console.log(chalk.red(`✗ Network start failed: ${error.message}`));
         process.exit(1);
     }
 };
 
-const peersCommand = async (argv) => {
+const peersCommand = async () => {
     printHeader();
 
     if (!Daemon.isRunning()) {
@@ -925,12 +758,11 @@ const peersCommand = async (argv) => {
     }
 
     try {
-        const response = await fetch(`${DAEMON_URL}/network/status`);
-        const result = await response.json();
+        const result = await (await fetch(`${DAEMON_URL}/network/status`)).json();
 
         console.log(chalk.cyan('Network Status:'));
         console.log(`  State:     ${result.state}`);
-        console.log(`  Local IP:  ${result.vlan?.localIP || 'not started'}`);
+        console.log(`  Local IP:  ${result.vlan ? result.vlan.localIP : 'not started'}`);
         console.log('');
 
         if (result.peers && result.peers.length > 0) {
@@ -941,7 +773,6 @@ const peersCommand = async (argv) => {
         } else {
             console.log(chalk.gray('  No peers connected'));
         }
-
     } catch (error) {
         console.log(chalk.red(`✗ Failed: ${error.message}`));
         process.exit(1);
@@ -950,7 +781,6 @@ const peersCommand = async (argv) => {
 
 const punchCommand = async (argv) => {
     printHeader();
-
     const { address, port } = argv;
 
     if (!address || !port) {
@@ -958,7 +788,6 @@ const punchCommand = async (argv) => {
         console.log(chalk.gray('  Usage: mp punch <address> <port>'));
         process.exit(1);
     }
-
     if (!Daemon.isRunning()) {
         console.log(chalk.red('✗ Daemon is not running'));
         process.exit(1);
@@ -968,26 +797,25 @@ const punchCommand = async (argv) => {
         const response = await fetch(`${DAEMON_URL}/network/punch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ address, port: parseInt(port) })
+            body: JSON.stringify({ address, port: parseInt(port, 10) })
         });
         const result = await response.json();
 
         console.log(chalk.green('✓ Hole punching initiated'));
         console.log(`  Target: ${address}:${port}`);
         console.log(`  Assigned IP: ${result.virtualIP}`);
-
     } catch (error) {
         console.log(chalk.red(`✗ Punch failed: ${error.message}`));
         process.exit(1);
     }
 };
 
-const tunInstallCommand = async (argv) => {
+// ============================================================
+// TUN / OVPN 命令
+// ============================================================
+const tunInstallCommand = () => {
     printHeader();
-    const os = require('os');
     const { execSync } = require('child_process');
-    const path = require('path');
-    const fs = require('fs');
 
     if (os.platform() !== 'win32') {
         console.log(chalk.green('✓ Linux: TUN is built-in (/dev/net/tun) — no driver needed'));
@@ -1037,7 +865,6 @@ const tunInstallCommand = async (argv) => {
             console.log(chalk.gray('Running installer (requires admin)...'));
             execSync(`"${installBat}"`, { stdio: 'inherit', timeout: 30000 });
         } else {
-            // 手动安装
             console.log(chalk.gray('Installing wintun driver...'));
             console.log(chalk.yellow('⚠ This requires Administrator privileges'));
             console.log(chalk.gray('  Run this command in an admin terminal, or:'));
@@ -1056,24 +883,22 @@ const tunInstallCommand = async (argv) => {
     console.log('');
     console.log(chalk.green('✓ TUN driver installed!'));
     console.log(chalk.gray('  Run "mp network" to use virtual NIC'));
-    console.log(chalk.gray('  If TUN mode still doesn\'t work, restart your computer'));
+    console.log(chalk.gray(`  If TUN mode still doesn't work, restart your computer`));
 };
 
-// OVPN 安装指引
-const ovpnInstallCommand = async (argv) => {
+const ovpnInstallCommand = () => {
     printHeader();
     const OvpnAdapter = require('wrtc-neo').OvpnAdapter || require('wrtc-neo/lib/ovpn-adapter');
+    const ovpnDir = path.join(HOME_DIR, 'ovpn');
 
     if (OvpnAdapter.isInstalled()) {
         console.log(chalk.green('✓ OpenVPN is already installed'));
         console.log(chalk.gray(`  Path: ${OvpnAdapter.findOpenVPN()}`));
         console.log('');
         console.log(chalk.cyan('TAP Adapter Info:'));
-        const adapter = new OvpnAdapter({ ovpnDir: path.join(require('os').homedir(), '.minep2p', 'ovpn') });
-        const tapName = adapter.getTapAdapterName();
-        const tapIP = adapter.getTapAdapterIP();
-        console.log(`  Name: ${tapName || 'not found'}`);
-        console.log(`  IP:   ${tapIP || 'not assigned'}`);
+        const adapter = new OvpnAdapter({ ovpnDir });
+        console.log(`  Name: ${adapter.getTapAdapterName() || 'not found'}`);
+        console.log(`  IP:   ${adapter.getTapAdapterIP() || 'not assigned'}`);
         console.log('');
         console.log(chalk.gray('  Run "mp network" to start the virtual LAN'));
         console.log(chalk.gray('  Run "mp ovpn-status" to check OVPN status'));
@@ -1090,8 +915,7 @@ const ovpnInstallCommand = async (argv) => {
     }
 };
 
-// OVPN 状态
-const ovpnStatusCommand = async (argv) => {
+const ovpnStatusCommand = async () => {
     printHeader();
 
     if (!Daemon.isRunning()) {
@@ -1101,16 +925,15 @@ const ovpnStatusCommand = async (argv) => {
     }
 
     try {
-        const response = await fetch(`${DAEMON_URL}/network/status`);
-        const result = await response.json();
+        const result = await (await fetch(`${DAEMON_URL}/network/status`)).json();
 
         console.log(chalk.cyan('OVPN Status:'));
         console.log(`  Mode:    ${result.mode === 'OVPN' ? chalk.green('OVPN') : chalk.yellow('UDP')}`);
         console.log(`  State:   ${result.state}`);
-        console.log(`  VLAN IP: ${result.vlan?.localIP || 'not started'}`);
+        console.log(`  VLAN IP: ${result.vlan ? result.vlan.localIP : 'not started'}`);
         console.log('');
 
-        if (result.vlan?.ovpn) {
+        if (result.vlan && result.vlan.ovpn) {
             const o = result.vlan.ovpn;
             console.log(chalk.cyan('OpenVPN:'));
             console.log(`  Installed: ${o.openvpnInstalled ? chalk.green('Yes') : chalk.red('No')}`);
@@ -1133,28 +956,29 @@ const ovpnStatusCommand = async (argv) => {
     }
 };
 
-// OVPN 密钥
-const ovpnKeyCommand = async (argv) => {
+const ovpnKeyCommand = () => {
     printHeader();
     const OvpnAdapter = require('wrtc-neo').OvpnAdapter || require('wrtc-neo/lib/ovpn-adapter');
-    const adapter = new OvpnAdapter({ ovpnDir: path.join(require('os').homedir(), '.minep2p', 'ovpn') });
-
+    const adapter = new OvpnAdapter({ ovpnDir: path.join(HOME_DIR, 'ovpn') });
     const key = adapter.getStaticKey();
+
     if (key) {
         console.log(chalk.cyan('OVPN Static Key:'));
         console.log(chalk.dim(key));
         console.log('');
         console.log(chalk.gray('Share this key with other players to connect'));
-        console.log(chalk.yellow(`  mp network --client <host> --port 1194 --key "..."`));
+        console.log(chalk.yellow('  mp network --client <host> --port 1194 --key "..."'));
     } else {
         console.log(chalk.yellow('No static key found'));
         console.log(chalk.gray('  Run "mp network" first to generate a key'));
     }
 };
 
+// ============================================================
+// 沙箱命令
+// ============================================================
 const sandboxCommand = async (argv) => {
     printHeader();
-    const DAEMON_URL = 'http://127.0.0.1:9527';
 
     try {
         const resp = await fetch(`${DAEMON_URL}/sandbox`, {
@@ -1166,8 +990,7 @@ const sandboxCommand = async (argv) => {
                 permission: argv.permission
             })
         });
-        const data = await resp.json();
-        console.log(chalk.green(JSON.stringify(data, null, 2)));
+        console.log(chalk.green(JSON.stringify(await resp.json(), null, 2)));
     } catch (e) {
         console.log(chalk.yellow('Daemon not running. Sandbox managed at plugin load time.'));
         console.log(chalk.gray('  Start daemon first: mp start'));
@@ -1177,81 +1000,65 @@ const sandboxCommand = async (argv) => {
     }
 };
 
+// ============================================================
+// Daemon 模式分支
+// ============================================================
+const isDaemon = process.argv.slice(1).includes('--daemon');
+
+if (isDaemon) {
+    const roomArg = process.argv.find((arg, i) => arg === '--room' || arg === '-r');
+    const room = roomArg ? process.argv[process.argv.indexOf(roomArg) + 1] : 'minep2p-default';
+    runDaemon(room).catch(err => {
+        console.error(err);
+        process.exit(1);
+    });
+    // daemon 模式下跳过 CLI 解析,防止与 yaggs 命令冲突
+    return;
+}
+
+// ============================================================
+// CLI 命令注册
+// ============================================================
 const pkg = require('./package.json');
 
 yaggs({ version: pkg.version })
     .command('start', 'Start MineP2P daemon in background', (y) => {
-        y.positional('room', {
-            describe: 'Room code to join (auto-generated if not specified)',
-            type: 'string'
-        });
+        y.positional('room', { describe: 'Room code to join (auto-generated if not specified)', type: 'string' });
     }, startCommand)
     .command('stop', 'Stop MineP2P daemon', null, stopCommand)
     .command('status', 'Check daemon status', null, statusCommand)
     .command('add', 'Add/join a new room', (y) => {
-        y.positional('room', {
-            describe: 'Room name',
-            type: 'string'
-        });
+        y.positional('room', { describe: 'Room name', type: 'string' });
     }, addCommand)
     .command('send', 'Send a message to all peers', (y) => {
-        y.positional('message', {
-            describe: 'Message to send',
-            type: 'string'
-        });
+        y.positional('message', { describe: 'Message to send', type: 'string' });
     }, sendCommand)
     .command('messages', 'View stored messages', (y) => {
         y
-            .positional('room', {
-                describe: 'Room name',
-                type: 'string',
-                default: 'minep2p-default'
-            })
-            .option('limit', {
-                describe: 'Number of messages to show',
-                type: 'number',
-                default: 20
-            });
+            .positional('room', { describe: 'Room name', type: 'string', default: 'minep2p-default' })
+            .option('limit', { describe: 'Number of messages to show', type: 'number', default: 20 });
     }, messagesCommand)
     .command('logs', 'View daemon logs', null, logsCommand)
     .command('set', 'Set a config value', (y) => {
         y
-            .positional('key', {
-                describe: 'Config key',
-                type: 'string'
-            })
-            .positional('value', {
-                describe: 'Config value',
-                type: 'string'
-            });
+            .positional('key', { describe: 'Config key', type: 'string' })
+            .positional('value', { describe: 'Config value', type: 'string' });
     }, setCommand)
     .command('get', 'View current config', (y) => {
-        y.positional('key', {
-            describe: 'Config key (optional)',
-            type: 'string'
-        });
+        y.positional('key', { describe: 'Config key (optional)', type: 'string' });
     }, getCommand)
     .command('config', 'Open configuration manager', configCommand)
     .command('config-reset', 'Reset config to default', (y) => {
-        y.positional('key', {
-            describe: 'Config key to reset (optional, resets all if not provided)',
-            type: 'string'
-        });
+        y.positional('key', { describe: 'Config key to reset (optional, resets all if not provided)', type: 'string' });
     }, resetCommand)
 
     // 插件商店命令
     .command('store', 'Browse plugin store', null, storeCommand)
     .command('search', 'Search plugins', (y) => {
-        y.positional('query', {
-            describe: 'Search query',
-            type: 'string'
-        });
+        y.positional('query', { describe: 'Search query', type: 'string' });
     }, searchCommand)
     .command('install', 'Install a plugin', (y) => {
-        y.positional('name', {
-            describe: 'Plugin name',
-            type: 'string'
-        });
+        y.positional('name', { describe: 'Plugin name', type: 'string' });
     }, installCommand)
     .command('plugins', 'List installed plugins', null, pluginsCommand)
 
@@ -1265,33 +1072,18 @@ yaggs({ version: pkg.version })
     .command('peers', 'List connected peers in virtual LAN', null, peersCommand)
     .command('punch', 'Punch to a peer for direct connection', (y) => {
         y
-            .positional('address', {
-                describe: 'Target public address',
-                type: 'string'
-            })
-            .positional('port', {
-                describe: 'Target port',
-                type: 'number'
-            });
+            .positional('address', { describe: 'Target public address', type: 'string' })
+            .positional('port', { describe: 'Target port', type: 'number' });
     }, punchCommand)
     .command('tun-install', 'Install TUN driver for virtual NIC support', null, tunInstallCommand)
     .command('ovpn-install', 'Check/install OpenVPN + TAP driver', null, ovpnInstallCommand)
     .command('ovpn-status', 'Show OVPN virtual NIC status', null, ovpnStatusCommand)
     .command('ovpn-key', 'Show OVPN static key for sharing', null, ovpnKeyCommand)
     .command('sandbox', 'Sandbox management', (y) => {
-        y.positional('action', {
-            describe: 'Action: blacklist, stats, permissions',
-            type: 'string',
-            default: 'stats'
-        })
-        .positional('plugin', {
-            describe: 'Plugin name',
-            type: 'string'
-        })
-        .option('permission', {
-            describe: 'Permission to grant/revoke',
-            type: 'string'
-        });
+        y
+            .positional('action', { describe: 'Action: blacklist, stats, permissions', type: 'string', default: 'stats' })
+            .positional('plugin', { describe: 'Plugin name', type: 'string' })
+            .option('permission', { describe: 'Permission to grant/revoke', type: 'string' });
     }, sandboxCommand)
 
     .help()
